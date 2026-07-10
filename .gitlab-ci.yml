@@ -1,0 +1,230 @@
+stages:
+  - test
+  - build_and_push
+
+variables:
+  # ----- Docker & DinD -----
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_DRIVER: overlay2
+  DOCKER_BUILDKIT: "1"
+  DOCKER_TLS_CERTDIR: "" # DinD بدون TLS
+  GIT_DEPTH: "0"
+  DOCKER_CLIENT_TIMEOUT: "600"
+  COMPOSE_HTTP_TIMEOUT: "600"
+
+  # ----- تنظیمات پیش‌فرض Build -----
+  IMAGE_NAMESPACE: "ilive" # می‌توانید برای هر سازمان عوض کنید
+  IMAGE_NAME: "$CI_PROJECT_NAME"
+  IMAGE_PATH: "$IMAGE_NAMESPACE/$IMAGE_NAME"
+  CONTEXT_DIR: "." # مسیر کانتکست داکر
+  DOCKERFILE: "Dockerfile" # مسیر Dockerfile
+  BUILD_ARGS: "" # به‌صورت "KEY=val KEY2=val2"
+  PLATFORMS: "linux/amd64" # برای multi-arch: "linux/amd64,linux/arm64"
+  USE_BUILDX: "false" # اگر true شود از buildx استفاده می‌کند
+  USE_CACHE: "false" # اگر true شود از کش رجیستری استفاده می‌کند
+
+default:
+  image: docker:27.1.2
+  tags: ["outside"]
+  services:
+    - name: docker:27.1.2-dind
+      alias: docker
+
+# ---- لاگین امن با Fail زودهنگام ----
+.before_login: &before_login
+  before_script:
+    - |
+      : "${REGISTRY_HOST:?REGISTRY_HOST is required}"
+      : "${REGISTRY_USER:?REGISTRY_USER is required}"
+      : "${REGISTRY_PASSWORD:?REGISTRY_PASSWORD is required}"
+
+      echo "Logging in to $REGISTRY_HOST..."
+      for i in 1 2 3 4 5; do
+        if echo "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_USER" --password-stdin; then
+          echo "Login OK"; break
+        fi
+        echo "Retry $i failed; sleeping 5s"; sleep 5
+        [ $i -eq 5 ] && { echo "Registry login failed"; exit 1; }
+      done
+
+# ---- تشخیص تگ هدف بر اساس برنچ/تگ ----
+.set_target_tag: &set_target_tag
+  - |
+    if [ -n "$CI_COMMIT_TAG" ]; then
+      # روی Git Tag دقیقاً همان تگ انتشار می‌رود
+      TARGET_TAG="$CI_COMMIT_TAG"
+    else
+      case "$CI_COMMIT_BRANCH" in
+        development) TARGET_TAG="dev" ;;
+        staging)     TARGET_TAG="stg" ;;
+        main|master) TARGET_TAG="prod" ;;
+        *)           TARGET_TAG="${CI_COMMIT_BRANCH//\//-}" ;; # برنچ‌های دیگر
+      esac
+    fi
+    echo "Resolved TARGET_TAG=$TARGET_TAG"
+
+# ---- آماده‌سازی Buildx (اختیاری) ----
+.setup_buildx: &setup_buildx
+  - |
+    if [ "$USE_BUILDX" = "true" ]; then
+      docker version
+      docker buildx version || true
+      docker buildx create --use --name qckbuilder || docker buildx use qckbuilder
+      docker buildx inspect --bootstrap
+    fi
+
+# ---- قالب Build & Push (با کش و multi-arch اختیاری) ----
+.build_push_tpl: &build_push_tpl
+  stage: build_and_push
+  <<: *before_login
+  script:
+    - *set_target_tag
+    - *setup_buildx
+    - |
+      APP_NAME="$IMAGE_NAME"
+      IMAGE_REPO="$REGISTRY_HOST/$IMAGE_PATH"
+      echo "Application: $APP_NAME"
+      echo "Image repo:  $IMAGE_REPO"
+      echo "Dockerfile:  $DOCKERFILE"
+      echo "Context dir: $CONTEXT_DIR"
+      echo "Platforms:   $PLATFORMS"
+      echo "Cache:       $USE_CACHE"
+      echo "Buildx:      $USE_BUILDX"
+
+      # برچسب‌های خروجی
+      TAG1="$IMAGE_REPO:$TARGET_TAG"
+      TAG2="$IMAGE_REPO:$TARGET_TAG-$CI_COMMIT_SHORT_SHA"
+
+      # ساخت آرگومان‌های build
+      BA=""
+      for kv in $BUILD_ARGS; do BA="$BA --build-arg $kv"; done
+
+      if [ "$USE_BUILDX" = "true" ]; then
+        # ----- Buildx (multi-arch) -----
+        CACHE_FROM=""
+        CACHE_TO=""
+        if [ "$USE_CACHE" = "true" ]; then
+          CACHE_FROM="--cache-from=type=registry,ref=$IMAGE_REPO:cache"
+          CACHE_TO="--cache-to=type=registry,ref=$IMAGE_REPO:cache,mode=max"
+        fi
+
+        docker buildx build \
+          --pull \
+          --platform "$PLATFORMS" \
+          -f "$DOCKERFILE" "$CONTEXT_DIR" \
+          -t "$TAG1" -t "$TAG2" \
+          $BA $CACHE_FROM $CACHE_TO \
+          --push
+      else
+        # ----- docker build کلاسیک -----
+        docker build --pull \
+          -f "$DOCKERFILE" "$CONTEXT_DIR" \
+          -t "$TAG1" -t "$TAG2" \
+          $BA
+
+        docker push "$TAG1"
+        docker push "$TAG2"
+
+        # کش رجیستری در حالت non-buildx پشتیبانی نمی‌شود (اختیاری می‌توانید با --buildkitd افزونه بدهید)
+      fi
+  after_script:
+    - docker logout "$REGISTRY_HOST"
+
+# ----------------- مراحل تست اختیاری مخصوص زبان‌ها -----------------
+
+# Node.js
+.node_test_tpl:
+  stage: test
+  image: node:20
+  cache:
+    key: "${CI_PROJECT_NAME}-node-${CI_COMMIT_REF_SLUG}"
+    paths: [node_modules/]
+    policy: pull-push
+  script:
+    - npm ci
+    - npm test --if-present
+  rules:
+    - if: '$RUN_TESTS == "node"'
+
+# Python
+.python_test_tpl:
+  stage: test
+  image: python:3.12
+  cache:
+    key: "${CI_PROJECT_NAME}-py-${CI_COMMIT_REF_SLUG}"
+    paths: [.venv/]
+    policy: pull-push
+  script:
+    - python -m venv .venv && . .venv/bin/activate
+    - pip install -U pip
+    - pip install -r requirements.txt || true
+    - pytest -q || true
+  rules:
+    - if: '$RUN_TESTS == "python"'
+
+# .NET
+.dotnet_test_tpl:
+  stage: test
+  image: mcr.microsoft.com/dotnet/sdk:9.0
+  script:
+    - dotnet restore
+    - dotnet test --no-build --verbosity normal || true
+  rules:
+    - if: '$RUN_TESTS == "dotnet"'
+
+# Go
+.go_test_tpl:
+  stage: test
+  image: golang:1.23
+  script:
+    - go mod download
+    - go test ./... -v || true
+  rules:
+    - if: '$RUN_TESTS == "go"'
+
+# Java (Maven)
+.java_test_tpl:
+  stage: test
+  image: maven:3.9-eclipse-temurin-21
+  cache:
+    key: "${CI_PROJECT_NAME}-mvn-${CI_COMMIT_REF_SLUG}"
+    paths: [".m2/repository"]
+    policy: pull-push
+  script:
+    - mvn -B -ntp -Dmaven.test.skip=false test || true
+  rules:
+    - if: '$RUN_TESTS == "java"'
+
+# ----------------- Build Jobs (شاخه‌ها و تگ‌ها) -----------------
+
+build_dev:
+  variables:
+    # اگر خواستید رفتار خاص dev داشته باشید (مثلاً build args یا platform مخصوص)، اینجا override کنید
+    TARGET_TAG: "dev"
+    BUILD_ARGS: "BUILD_MODE=development"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "development"'
+  <<: *build_push_tpl
+
+build_stg:
+  variables:
+    TARGET_TAG: "stg"
+    BUILD_ARGS: "BUILD_MODE=staging"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "staging"'
+  <<: *build_push_tpl
+
+build_prod:
+  variables:
+    TARGET_TAG: "prod"
+    BUILD_ARGS: "BUILD_MODE=production"
+    DOCKERFILE: "Dockerfile.next"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "master"'
+  <<: *build_push_tpl
+
+build_tag_release:
+  # هر زمان Git Tag بزنید، همان تگ روی ایمیج ساخته و push می‌شود
+  rules:
+    - if: "$CI_COMMIT_TAG"
+  <<: *build_push_tpl
